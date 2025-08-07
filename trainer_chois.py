@@ -234,9 +234,9 @@ class Trainer(object):
         self.use_object_split = self.opt.use_object_split
         self.data_root_folder = self.opt.data_root_folder #processed_data
         self.prep_dataloader(window_size=opt.window)
-
+        #SMPL-X 모델
         self.bm_dict = self.ds.bm_dict 
-
+        #사용하게 되면 평가를 학습데이터셋에 대해서 진행하게 됨 
         self.test_on_train = self.opt.test_on_train 
 
         self.input_first_human_pose = self.opt.input_first_human_pose 
@@ -248,12 +248,13 @@ class Trainer(object):
         self.loss_w_feet = self.opt.loss_w_feet 
         self.loss_w_fk = self.opt.loss_w_fk 
         self.loss_w_obj_pts = self.opt.loss_w_obj_pts 
-
+        #언어 조건 사용 클립 버전-> ViT-B/32
         if self.add_language_condition:
             clip_version = 'ViT-B/32'
             self.clip_model = self.load_and_freeze_clip(clip_version) 
 
         self.use_long_planned_path = self.opt.use_long_planned_path 
+        #롱 시퀀스 테스트시 특정 오브젝트 이름과 씬 이름을 지정해 주겠다.
         self.test_object_name = self.opt.test_object_name 
         self.test_scene_name = self.opt.test_scene_name 
         if self.use_long_planned_path:
@@ -273,7 +274,7 @@ class Trainer(object):
                 test_long_seq = True 
             else:
                 test_long_seq = False 
-
+            # 다른 데이터셋 FUTURE
             self.unseen_seq_ds = UnseenCanoObjectTrajDataset(train=False, \
                 data_root_folder=self.data_root_folder, \
                 window=opt.window, use_object_splits=self.use_object_split, \
@@ -360,14 +361,14 @@ class Trainer(object):
             texts = clip.tokenize(raw_text, truncate=True).to(device) # [bs, context_length] # if n_tokens > 77 -> will truncate
         
         return self.clip_model.encode_text(texts).float().detach() # BS X 512 #raw_text길이 에 512 차원의 임베딩
-
+   #데이터로더 window_size = 120 
     def prep_dataloader(self, window_size):
         # Define dataset
         train_dataset = CanoObjectTrajDataset(train=True, data_root_folder=self.data_root_folder, \
             window=window_size, use_object_splits=self.use_object_split, \
             input_language_condition=self.add_language_condition, \
             use_random_frame_bps=self.use_random_frame_bps, \
-            use_object_keypoints=self.use_object_keypoints)
+            use_object_keypoints=self.use_object_keypoints)  
         val_dataset = CanoObjectTrajDataset(train=False, data_root_folder=self.data_root_folder, \
             window=window_size, use_object_splits=self.use_object_split, \
             input_language_condition=self.add_language_condition, \
@@ -456,7 +457,7 @@ class Trainer(object):
         mask[:, 0, :] = torch.zeros(data.shape[0], data.shape[2]).to(data.device) # BS X D  
 
         return mask 
-
+  #******
     def train(self):
         init_step = self.step 
         for idx in range(init_step, self.train_num_steps):
@@ -1990,15 +1991,16 @@ class Trainer(object):
         # 1. Compute penetration loss between hand vertices and object vertices. 
         # hand_verts = human_verts.squeeze(1)[:, :, self.hand_vertex_idxs, :] # BS X T X N_hand X 3 
         pred_normalized_obj_trans = pred_clean_x[:, :, :3] # N X T X 3 
-
+        #프레임 마다 bps즉 객체표현이 다르다면 프레임별 절대회전을 예측하고 한 프레임 기준으로만 bps를 구성하면 예측은 뽑은 bps의 대한 상대회전으로 다룸 
         if self.use_random_frame_bps:
+            # 결과가 상대회전임
             pred_obj_rel_rot_mat = pred_clean_x[:, :, 3:3+9].reshape(num_seq, -1, 3, 3) # N X T X 3 X 30
-            if curr_window_ref_obj_rot_mat is not None:
+            if curr_window_ref_obj_rot_mat is not None: #기준이되는 object의 회전이 있다면... 상대회전
                 pred_obj_rot_mat = self.ds.rel_rot_to_seq(pred_obj_rel_rot_mat, curr_window_ref_obj_rot_mat)
-            else:
+            else: # 없다면 첫번째를 쓰는데 버그날 수 도 있음 
                 pred_obj_rot_mat = self.ds.rel_rot_to_seq(pred_obj_rel_rot_mat, \
                     data_dict['obj_rot_mat'].repeat(num_seq, 1, 1, 1)) # Bug? Since for the windows except the first one, the reference obj mat is not the originbal one in data? 
-        else:
+        else:# 절대 회전행렬을 직접 예측한 것으로 가정
             pred_obj_rot_mat = pred_clean_x[:, :, 3:3+9].reshape(num_seq, -1, 3, 3) # N X T X 3 X 3
 
         pred_seq_com_pos = self.ds.de_normalize_obj_pos_min_max(pred_normalized_obj_trans) # N X T X 3
@@ -3019,93 +3021,4 @@ class Trainer(object):
             if idx >= 1:
                 break 
 
-        return human_verts_list, human_jnts_list, trans_list, global_rot_mat, pred_seq_com_pos, pred_obj_rot_mat, \
-        obj_verts_list, human_mesh_faces_list, obj_mesh_faces_list, dest_out_vid_path  
-#
-def run_train(opt, device):
-    # Prepare Directories
-    save_dir = Path(opt.save_dir)
-    wdir = save_dir / 'weights'
-    wdir.mkdir(parents=True, exist_ok=True)
-
-    # Save run settings
-    with open(save_dir / 'opt.yaml', 'w') as f:
-        yaml.safe_dump(vars(opt), f, sort_keys=True)
-
-    # Define model  모델부분 학습시작 제발 봐 여기야 
-    repr_dim = 3 + 9 # Object relative translation (3) and relative rotation matrix (9)  
-
-    repr_dim += 24 * 3 + 22 * 6 # Global human joint positions and rotation 6D representation 
-
-    if opt.use_object_keypoints:
-        repr_dim += 4 
-
-    loss_type = "l1"
-
-    diffusion_model = ObjectCondGaussianDiffusion(opt, d_feats=repr_dim, d_model=opt.d_model, \
-                n_dec_layers=opt.n_dec_layers, n_head=opt.n_head, d_k=opt.d_k, d_v=opt.d_v, \
-                max_timesteps=opt.window+1, out_dim=repr_dim, timesteps=1000, \
-                objective="pred_x0", loss_type=loss_type, \
-                input_first_human_pose=opt.input_first_human_pose, \
-                use_object_keypoints=opt.use_object_keypoints) 
-   
-    diffusion_model.to(device)
-
-    trainer = Trainer(
-        opt,
-        diffusion_model,
-        train_batch_size=opt.batch_size, # 32
-        train_lr=opt.learning_rate, # 1e-4
-        train_num_steps=400000,         # 700000, total training steps
-        gradient_accumulate_every=2,    # gradient accumulation steps
-        ema_decay=0.995,                # exponential moving average decay
-        amp=True,                        # turn on mixed precision
-        results_folder=str(wdir),
-    )
-    trainer.train()
-
-    torch.cuda.empty_cache()
-
-def run_sample(opt, device):
-    # Prepare Directories
-    save_dir = Path(opt.save_dir)
-    wdir = save_dir / 'weights'
-
-    # Define model     
-    repr_dim = 3 + 9 
-
-    repr_dim += 24 * 3 + 22 * 6 
-
-    if opt.use_object_keypoints:
-        repr_dim += 4 
-   
-    loss_type = "l1"
-
-    diffusion_model = ObjectCondGaussianDiffusion(opt, d_feats=repr_dim, d_model=opt.d_model, \
-                n_dec_layers=opt.n_dec_layers, n_head=opt.n_head, d_k=opt.d_k, d_v=opt.d_v, \
-                max_timesteps=opt.window+1, out_dim=repr_dim, timesteps=1000, \
-                objective="pred_x0", loss_type=loss_type, \
-                input_first_human_pose=opt.input_first_human_pose, \
-                use_object_keypoints=opt.use_object_keypoints)
-
-    diffusion_model.to(device)
-
-    trainer = Trainer(
-        opt,
-        diffusion_model,
-        train_batch_size=opt.batch_size, # 32
-        train_lr=opt.learning_rate, # 1e-4
-        train_num_steps=8000000,         # 700000, total training steps
-        gradient_accumulate_every=2,    # gradient accumulation steps
-        ema_decay=0.995,                # exponential moving average decay
-        amp=True,                        # turn on mixed precision
-        results_folder=str(wdir),
-        use_wandb=False 
-    )
-   
-    if opt.use_long_planned_path:
-        trainer.cond_sample_res_w_long_planned_path() 
-    else:
-        trainer.cond_sample_res()
-
-    torch.cuda.empty_cache()
+        return human_verts_list, human_jnts_list, trans_list, global_rot_mat, pred_seq_com_pos, pred_obj_rot_mat, obj_verts_list, human_mesh_faces_list, obj_mesh_faces_list, dest_out_vid_path  

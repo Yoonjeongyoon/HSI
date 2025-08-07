@@ -272,13 +272,13 @@ class ObjectCondGaussianDiffusion(nn.Module):
         use_object_keypoints=False, 
     ):
         super().__init__()
-
+## bps를 1024*3으로 받아서 리니어-> 렐루-> 리니어로 256으로 뱉음
         self.bps_encoder = nn.Sequential(
             nn.Linear(in_features=1024*3, out_features=512),
             nn.ReLU(),
             nn.Linear(in_features=512, out_features=256),
             )
-
+## 
         self.clip_encoder = nn.Sequential(
             nn.Linear(in_features=512, out_features=512),
             )

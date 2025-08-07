@@ -1,8 +1,13 @@
 import argparse
 import os
 import torch
-from trainer_chois import run_train
+from trainer_chois import *
+from trainer_chois import Trainer
 
+from pathlib import Path
+import yaml
+from manip.model.transformer_object_motion_cond_diffusion import ObjectCondGaussianDiffusion 
+#store_true(있으면 그냥 true)
 def parse_opt():
     parser = argparse.ArgumentParser()
     parser.add_argument('--project', default='runs/train', help='project/name')
@@ -84,41 +89,46 @@ def run_train(opt, device):
         yaml.safe_dump(vars(opt), f, sort_keys=True)
 
     # Define model  모델부분 학습시작 제발 봐 여기야 
-    repr_dim = 3 + 9 # Object relative translation (3) and relative rotation matrix (9)  
+    repr_dim = 3 + 9 # Object relative translation (3) and relative rotation matrix (9)  오브젝트 차원 12
 
     repr_dim += 24 * 3 + 22 * 6 # Global human joint positions and rotation 6D representation 
 
-    if opt.use_object_keypoints:
+    if opt.use_object_keypoints: #오브젝트 키포인트?? 
         repr_dim += 4 
-
+# repr_dim 220
     loss_type = "l1"
-
+# d_model->트랜스포머의 중간표현의 차원, n_head-> multi head self attention의 헤드 개수, d_k -> 트랜스포머 키 차원, d_v -> 트랜스포머 벨류차원
+# max_timesteps-> 120프레임 + conditional 1개  loss는 L1  총차원이 220?
+# 디퓨전 모델 클래스 정의 
     diffusion_model = ObjectCondGaussianDiffusion(opt, d_feats=repr_dim, d_model=opt.d_model, \
                 n_dec_layers=opt.n_dec_layers, n_head=opt.n_head, d_k=opt.d_k, d_v=opt.d_v, \
                 max_timesteps=opt.window+1, out_dim=repr_dim, timesteps=1000, \
                 objective="pred_x0", loss_type=loss_type, \
                 input_first_human_pose=opt.input_first_human_pose, \
                 use_object_keypoints=opt.use_object_keypoints) 
-   
+   #디바이스 올리고
     diffusion_model.to(device)
-
+#트레이너 정의 
     trainer = Trainer(
         opt,
         diffusion_model,
         train_batch_size=opt.batch_size, # 32
         train_lr=opt.learning_rate, # 1e-4
-        train_num_steps=400000,         # 700000, total training steps
+        train_num_steps=400001,         # 700000, total training steps
         gradient_accumulate_every=2,    # gradient accumulation steps
         ema_decay=0.995,                # exponential moving average decay
         amp=True,                        # turn on mixed precision
         results_folder=str(wdir),
     )
+    #디버깅 시작
     trainer.train()
 
     torch.cuda.empty_cache()
 if __name__ == "__main__":
     opt = parse_opt()
+    
     opt.save_dir = os.path.join(opt.project, opt.exp_name)
     opt.exp_name = opt.save_dir.split('/')[-1]
     device = torch.device(f"cuda:{opt.device}" if torch.cuda.is_available() else "cpu")
+    print(">>> opt.data_root_folder =", opt.data_root_folder)
     run_train(opt, device)
