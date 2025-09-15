@@ -360,7 +360,7 @@ if __name__ == '__main__':
     #     ), 
 
     #     'InterDiff': lambda: get_motion_loader_for_chois_eval(
-    #         '/move/u/jiamanli/eccv24_chois/res_npz_files/interdiff_unseen_obj',
+    #         '/move/u/jiamanli/eccv24_chois//interdiff_unseen_obj',
     #         batch_size,
     #     ), 
 

@@ -546,8 +546,8 @@ def rotate_root_at_frame_w_obj(X, Q, obj_x, obj_q, trans2joint_list, n_past=1, f
     # Q, X = quat_ik(new_glob_Q, new_glob_X, parents)
 
     return new_glob_X[:, :, 0, :], new_glob_Q[:, :, 0, :], new_obj_x, new_obj_q
-
-def extract_feet_contacts(pos, lfoot_idx, rfoot_idx, velfactor=0.02):
+#발 접촉여부 판단 코드  일단은 2개 씩 
+def extract_feet_contacts(pos, lfoot_idx, rfoot_idx, velfactor=0.02, min_len=10, fill_gap=3, start_th=None, stop_th=None):
     """
     Extracts binary tensors of feet contacts
 
@@ -557,17 +557,83 @@ def extract_feet_contacts(pos, lfoot_idx, rfoot_idx, velfactor=0.02):
     :param velfactor: velocity threshold to consider a joint moving or not
     :return: binary tensors of left foot contacts and right foot contacts
     """
-    lfoot_xyz = (pos[1:, lfoot_idx, :] - pos[:-1, lfoot_idx, :]) ** 2
-    contacts_l = np.sum(lfoot_xyz, axis=-1) < velfactor
+    def hysteresis_mask(vel, s_th, e_th):
+        # vel: (T-1,)
+        contact = np.zeros_like(vel, dtype=bool)
+        in_contact = False
+        for t, v in enumerate(vel):
+            if not in_contact and v < s_th:
+                in_contact = True
+            elif in_contact and v > e_th:
+                in_contact = False
+            contact[t] = in_contact
+        # pad to length T
+        return np.concatenate([contact, contact[-1:]], axis=0)
 
-    rfoot_xyz = (pos[1:, rfoot_idx, :] - pos[:-1, rfoot_idx, :]) ** 2
-    contacts_r = np.sum(rfoot_xyz, axis=-1) < velfactor
+    # --- per-joint contact with hysteresis ---
+    def joint_contact(idx):
+        v = np.linalg.norm(pos[1:, idx, :] - pos[:-1, idx, :], axis=-1)  # (T-1,)
+        s_th = start_th if start_th is not None else max(1e-12, 0.95 * velfactor)
+        e_th = stop_th  if stop_th  is not None else max(s_th + 1e-12, 1.05 * velfactor)  # ensure s_th < e_th
+        return hysteresis_mask(v, s_th, e_th)  # (T,)
 
-    # Duplicate the last frame for shape consistency
-    contacts_l = np.concatenate([contacts_l, contacts_l[-1:]], axis=0)
-    contacts_r = np.concatenate([contacts_r, contacts_r[-1:]], axis=0)
+    # 각 관절별로 따로 속도 → 접촉 마스크 (거리/frame 기준)
+    def runs_from_mask(mask):
+            T = len(mask)
+            iv, in_run, s = [], False, 0
+            for t in range(T):
+                v = bool(mask[t])
+                if v and not in_run:
+                    in_run, s = True, t
+                elif not v and in_run:
+                    in_run = False
+                    iv.append((s, t))
+            if in_run:
+                iv.append((s, T))
+            return iv
 
-    return contacts_l, contacts_r
+    def clean_intervals(intervals, min_len=1, fill_gap=0):
+        if not intervals:
+            return []
+        # 1) 짧은 구간 제거
+        iv = [(s, e) for (s, e) in intervals if (e - s) >= min_len]
+        if not iv:
+            return []
+        # 2) 짧은 갭 병합
+        iv.sort()
+        merged = [iv[0]]
+        for s, e in iv[1:]:
+            ps, pe = merged[-1]
+            if s - pe <= fill_gap:
+                merged[-1] = (ps, max(pe, e))
+            else:
+                merged.append((s, e))
+        return merged
+
+    def mask_from_intervals(intervals, T):
+        m = np.zeros(T, dtype=bool)
+        for s, e in intervals:
+            m[s:e] = True
+        return m
+
+    # 관절별 접촉 마스크 (T,)
+    l_ank = joint_contact(lfoot_idx[0])
+    l_toe = joint_contact(lfoot_idx[1])
+    r_ank = joint_contact(rfoot_idx[0])
+    r_toe = joint_contact(rfoot_idx[1])
+
+    T = pos.shape[0]
+    # 후처리: 최소 길이 & 짧은 갭 메우기
+    l_ank = mask_from_intervals(clean_intervals(runs_from_mask(l_ank), min_len, fill_gap), T)
+    l_toe = mask_from_intervals(clean_intervals(runs_from_mask(l_toe), min_len, fill_gap), T)
+    r_ank = mask_from_intervals(clean_intervals(runs_from_mask(r_ank), min_len, fill_gap), T)
+    r_toe = mask_from_intervals(clean_intervals(runs_from_mask(r_toe), min_len, fill_gap), T)
+
+    # (T,2)로 스택: [:,0]=ankle(heel), [:,1]=toe
+    left_foot_contacts  = np.stack([l_ank, l_toe], axis=1)
+    right_foot_contacts = np.stack([r_ank, r_toe], axis=1)
+
+    return left_foot_contacts, right_foot_contacts
 
 def quat_slerp(x, y, a):
     """

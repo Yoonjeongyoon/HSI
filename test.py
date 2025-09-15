@@ -70,6 +70,8 @@ def parse_opt():
 
     parser.add_argument("--test_unseen_objects", action="store_true")
 
+    # Save SMPL motion parameters as NPZ files
+    parser.add_argument("--save_motion_params", action="store_true", help="Save SMPL motion parameters as NPZ files")
    
     opt = parser.parse_args()
     return opt
