@@ -430,7 +430,7 @@ def compute_metrics(ori_verts_gt, ori_verts_pred, ori_jpos_gt, ori_jpos_pred, hu
     foot_sliding_jnts = compute_foot_sliding_for_smpl(ori_jpos_pred.detach().cpu().numpy(), floor_height)
     gt_foot_sliding_jnts = compute_foot_sliding_for_smpl(ori_jpos_gt.detach().cpu().numpy(), gt_floor_height)
 
-    # Compute contact score 
+    # Compute  score 
     num_obj_verts = gt_obj_verts.shape[1]
     if use_joints24:
         # contact_threh = 0.05

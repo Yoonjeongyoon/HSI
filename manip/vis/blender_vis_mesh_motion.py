@@ -111,7 +111,7 @@ def run_blender_rendering_and_save2video(obj_folder_path, out_folder_path, out_v
             " -b -- --folder "+obj_folder_path+" --scene "+\
             scene_blend_path+" --out-folder "+out_folder_path+" --material-color "+mat_color, shell=True)    
 
-    use_ffmpeg = False
+    use_ffmpeg = True
     if use_ffmpeg:
         images_to_video(out_folder_path, out_vid_path)
     else:

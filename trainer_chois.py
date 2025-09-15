@@ -38,7 +38,11 @@ from evaluation_metrics import compute_metrics, determine_floor_height_and_conta
 
 import clip 
 
+from clean_footskate import clean_motion
+
 import random
+
+
 torch.manual_seed(1)
 random.seed(1)
 
@@ -85,17 +89,68 @@ def compute_signed_distances(
     signed_dists = signed_dists[0, 0, :, 0, :] * sdf_extents.cpu().detach().numpy().max() / 2. # T X Nv 
     
     return signed_dists
-# 사람메시 만드는 모델
-def run_smplx_model(root_trans, aa_rot_rep, betas, gender, bm_dict, return_joints24=True):
-    # root_trans: BS X T X 3
-    # aa_rot_rep: BS X T X 22 X 3 
-    # betas: BS X 16
-    # gender: BS 
-    bs, num_steps, num_joints, _ = aa_rot_rep.shape
-    if num_joints != 52:
-        padding_zeros_hand = torch.zeros(bs, num_steps, 30, 3).to(aa_rot_rep.device) # BS X T X 30 X 3 
-        aa_rot_rep = torch.cat((aa_rot_rep, padding_zeros_hand), dim=2) # BS X T X 52 X 3 
 
+def compute_foot_heights_from_smpl_v2(mesh_jnts_1t, mesh_verts_1t, L_ANKLE=7, R_ANKLE=8, L_TOE=10, R_TOE=11,
+                                      xy_radius=0.01, agg='p95', margin=0.001):
+    """
+    mesh_jnts_1t  : (T, J, 3)  # run_smplx_model() 출력에서 [0] 슬라이스
+    mesh_verts_1t : (T, V, 3)
+    반환: dict {22,23,24,25}  # 22=R_ankle_c, 23=R_toe_c, 24=L_ankle_c, 25=L_toe_c
+         값은 '부모관절 z - 주변 최저 버텍스 z'의 강건 통계 + margin [m]
+    """
+    T = mesh_jnts_1t.shape[0]
+
+    def min_z_near_joint(t, jidx):
+        jxy = mesh_jnts_1t[t, jidx, :2]            # (2,)
+        vxy = mesh_verts_1t[t, :, :2]              # (V,2)
+        vz  = mesh_verts_1t[t, :,  2]              # (V,)
+        dxy = torch.linalg.norm(vxy - jxy, dim=-1) # (V,)
+        m = dxy <= xy_radius
+        return vz[m].min() if m.any() else vz.min()
+
+    def depths(base_j):
+        # 프레임별: 관절 z - 주변 최저 버텍스 z
+        vals = []
+        for t in range(T):
+            z_base = mesh_jnts_1t[t, base_j, 2]
+            z_min  = min_z_near_joint(t, base_j)
+            vals.append((z_base - z_min).clamp_min(0))
+        return torch.stack(vals)  # (T,)
+
+    # 오른발(22=ankle_c, 23=toe_c) / 왼발(24,25)
+    d_r_ank = depths(R_ANKLE)
+    d_r_toe = depths(R_TOE)
+    d_l_ank = depths(L_ANKLE)
+    d_l_toe = depths(L_TOE)
+
+    def robust(v, how):
+        if how == 'median': return v.median()
+        k = int((0.90 if how == 'p90' else 0.95) * len(v))
+        k = min(max(k, 1), len(v))
+        return v.kthvalue(k).values
+
+    h22 = robust(d_r_ank, agg) + margin  # R_ankle_contact
+    h23 = robust(d_r_toe, agg) + margin  # R_foot_contact
+    h24 = robust(d_l_ank, agg) + margin  # L_ankle_contact
+    h25 = robust(d_l_toe, agg) + margin  # L_foot_contact
+
+    return {22: float(h22), 23: float(h23), 24: float(h24), 25: float(h25)}
+def run_smplx_model(root_trans, aa_rot_rep, betas, gender, bm_dict, return_joints24=True):
+    # root_trans: 1 X T X 3
+    # aa_rot_rep: 1 X T X 22 X 3 
+    # betas: 16 (체형 파라미터의 개수 16개 값은 gt에서 가져옴)
+    # gender: 
+    #배치사이즈 = bs = 1
+    # 프레임 수 = num_steps = 120 
+    # 관절 수 = num_joints = 22 
+    # smpl의 입력 root_orient=1x3, pose_body=21x3, pose_hand=30x3, betas= 16, trans = 1x3 나머지 jaw와 eye는 사용 안함 그래서 52차원
+    # def forward(self, root_orient=None, pose_body=None, pose_hand=None, pose_jaw=None, pose_eye=None, betas=None,
+    #             trans=None, dmpls=None, expression=None, v_template =None, joints=None, v_shaped=None, return_dict=False,  **kwargs):
+    bs, num_steps, num_joints, _ = aa_rot_rep.shape
+    if num_joints != 52: 
+        padding_zeros_hand = torch.zeros(bs, num_steps, 30, 3).to(aa_rot_rep.device) # BS X T X 30 X 3  #30차원 0으로 패딩해서 콘캣
+        aa_rot_rep = torch.cat((aa_rot_rep, padding_zeros_hand), dim=2) # BS X T X 52 X 3 
+    #aa_rot_rep = 120 x 52 x 3 
     aa_rot_rep = aa_rot_rep.reshape(bs*num_steps, -1, 3) # (BS*T) X n_joints X 3 
     betas = betas[:, None, :].repeat(1, num_steps, 1).reshape(bs*num_steps, -1) # (BS*T) X 16 
     gender = np.asarray(gender)[:, np.newaxis].repeat(num_steps, axis=1)
@@ -103,11 +158,11 @@ def run_smplx_model(root_trans, aa_rot_rep, betas, gender, bm_dict, return_joint
 
     smpl_trans = root_trans.reshape(-1, 3) # (BS*T) X 3  
     smpl_betas = betas # (BS*T) X 16
-    smpl_root_orient = aa_rot_rep[:, 0, :] # (BS*T) X 3 
+    smpl_root_orient = aa_rot_rep[:, 0, :] # (BS*T) X 3 # 스칼라 인덱싱 -> 차원을 날려버림.. 유지하려면 슬라이스 인덱싱 하면 됌 
     smpl_pose_body = aa_rot_rep[:, 1:22, :].reshape(-1, 63) # (BS*T) X 63
     smpl_pose_hand = aa_rot_rep[:, 22:, :].reshape(-1, 90) # (BS*T) X 90 
 
-    B = smpl_trans.shape[0] # (BS*T) 
+    B = smpl_trans.shape[0] # (BS*T) = 120 
 
     smpl_vals = [smpl_trans, smpl_root_orient, smpl_betas, smpl_pose_body, smpl_pose_hand]
     # batch may be a mix of genders, so need to carefully use the corresponding SMPL body model
@@ -159,7 +214,7 @@ def run_smplx_model(root_trans, aa_rot_rep, betas, gender, bm_dict, return_joint
     x_pred_smpl_joints = x_pred_smpl_joints.reshape(bs, num_steps, -1, 3) # BS X T X 22 X 3/BS X T X 24 X 3  
     x_pred_smpl_verts = x_pred_smpl_verts.reshape(bs, num_steps, -1, 3) # BS X T X 6890 X 3 
 
-    mesh_faces = pred_body.f 
+    mesh_faces = pred_body.f # face 는 그대로 
     
     return x_pred_smpl_joints, x_pred_smpl_verts, mesh_faces 
 
@@ -182,7 +237,7 @@ class Trainer(object):
         amp=False,
         step_start_ema=2000,
         ema_update_every=10,
-        save_and_sample_every=40000,
+        save_and_sample_every=40000, # 저장 주기 
         results_folder='./results',
         use_wandb=True,   
     ):
@@ -215,7 +270,10 @@ class Trainer(object):
 
         self.vis_folder = results_folder.replace("weights", "vis_res")
 
-        self.opt = opt 
+        self.opt = opt
+        
+        # Motion parameters saving option
+        self.save_motion_params = getattr(opt, 'save_motion_params', False) 
 
         self.window = opt.window
 
@@ -405,8 +463,7 @@ class Trainer(object):
     def prep_start_end_condition_mask_pos_only(self, data, actual_seq_len):
         # data: BS X T X D (3+9)
         # actual_seq_len: BS 
-        tmp_mask = torch.arange(self.window).expand(data.shape[0], \
-                self.window) == (actual_seq_len[:, None].repeat(1, self.window)-1)
+        tmp_mask = torch.arange(self.window).expand(data.shape[0], self.window) == (actual_seq_len[:, None].repeat(1, self.window)-1)
                 # BS X max_timesteps
         tmp_mask = tmp_mask.to(data.device)[:, :, None] # BS X T X 1
 
@@ -443,7 +500,7 @@ class Trainer(object):
                     # BS X max_timesteps
                 curr_tmp_mask = curr_tmp_mask.to(data.device)[:, :, None] # BS X T X 1
 
-                tmp_mask = (~curr_tmp_mask)*tmp_mask
+                tmp_mask = (~curr_tmp_mask)*tmp_mask 
 
         # Missing regions are ones, the condition regions are zeros. 
         mask = torch.ones_like(data[:, :, :2]).to(data.device) # BS X T X 2
@@ -459,27 +516,30 @@ class Trainer(object):
         return mask 
   #******
     def train(self):
+        #이어서 학습할 경우 초기 스탭 
         init_step = self.step 
         for idx in range(init_step, self.train_num_steps):
+            # 누적 기울기 초기화
             self.optimizer.zero_grad()
-        
+            #loss나 그레디언트가 NaN발생하면 현재 미니배치를 다 뛰어 넘음 
             nan_exists = False # If met nan in loss or gradient, need to skip to next data. 
+
+            #배치는 32를 보지만 업데이트는 64를 보고 평균내서 업데이트 
             for i in range(self.gradient_accumulate_every):
-                data_dict = next(self.dl)
+                data_dict = next(self.dl) # 배치사이즈가 32이므로 앞에 배치사이즈가 기본으로 곱해짐 
                 
                 human_data = data_dict['motion'].cuda() # BS X T X (24*3 + 22*6)
                 obj_data = data_dict['obj_motion'].cuda() # BS X T X (3+9) 
-
+                #시퀀스 당 bps를 때려박아서 용량이 많이 늘어난 느낌 
                 obj_bps_data = data_dict['input_obj_bps'].cuda().reshape(-1, 1, 1024*3) # BS X 1 X 1024 X 3 -> BS X 1 X (1024*3) 
-                #사람 조인트의 위치
+                #사람 조인트의 위치 
                 rest_human_offsets = data_dict['rest_human_offsets'].cuda() # BS X 24 X 3 
 
                 ori_data_cond = obj_bps_data # BS X 1 X (1024*3) 
 
                 # Generate padding mask 실제 모션의 길이를 재고 130 이하면 전부 패딩해서 0으로 채워버림 즉 입력 최대 프레임이 120이지 고정인건 아님 
                 actual_seq_len = data_dict['seq_len'] + 1 # BS, + 1 since we need additional timestep for noise level 
-                tmp_mask = torch.arange(self.window+1).expand(obj_data.shape[0], \
-                self.window+1) < actual_seq_len[:, None].repeat(1, self.window+1)
+                tmp_mask = torch.arange(self.window+1).expand(obj_data.shape[0], self.window+1) < actual_seq_len[:, None].repeat(1, self.window+1)
                 # BS X max_timesteps
                 padding_mask = tmp_mask[:, None, :].to(obj_data.device)
 
@@ -488,37 +548,31 @@ class Trainer(object):
                 
                 cond_mask = self.prep_mimic_A_star_path_condition_mask_pos_xy_only(obj_data, data_dict['seq_len'])
                 cond_mask = end_pos_cond_mask * cond_mask 
-              
+                
                 # Add the first human pose as input condition 
                 human_cond_mask = torch.ones_like(human_data).to(human_data.device)
-                if self.input_first_human_pose: #첫번째 사람의 포즈가 조건으로 제공될경우
+                if self.input_first_human_pose: #첫번째 사람의 포즈가 조건으로 제공될 경우 
                     human_cond_mask[:, 0, :] = 0 
                 
                 cond_mask = torch.cat((cond_mask, human_cond_mask), dim=-1) # BS X T X (3+6+24*3+22*6) 
-
+                
                 with autocast(enabled = self.amp):    
                     contact_data = data_dict['contact_labels'].cuda() # BS X T X 4 
                    
                     data = torch.cat((obj_data, human_data, contact_data), dim=-1) 
-                    cond_mask = torch.cat((cond_mask, \
-                            torch.ones_like(contact_data).to(cond_mask.device)), dim=-1) 
+                    cond_mask = torch.cat((cond_mask, torch.ones_like(contact_data).to(cond_mask.device)), dim=-1) 
                     
                     if self.add_language_condition:
                         text_anno_data = data_dict['text']
                         language_input = self.encode_text(text_anno_data) # BS X 512 
                         language_input = language_input.to(data.device)
                        
-                        loss_diffusion, loss_obj, loss_human, loss_feet, loss_fk, loss_obj_pts = \
-                        self.model(data, ori_data_cond, cond_mask, padding_mask, \
-                        language_input=language_input, \
-                        rest_human_offsets=rest_human_offsets, ds=self.ds, data_dict=data_dict)
+                        loss_diffusion, loss_obj, loss_human, loss_feet, loss_fk, loss_obj_pts = self.model(data, ori_data_cond, cond_mask, padding_mask, language_input=language_input, rest_human_offsets=rest_human_offsets, ds=self.ds, data_dict=data_dict)
                     else:
-                        loss_diffusion = self.model(data, ori_data_cond, cond_mask, padding_mask, \
-                        rest_human_offsets=rest_human_offsets)
+                        loss_diffusion = self.model(data, ori_data_cond, cond_mask, padding_mask, rest_human_offsets=rest_human_offsets)
                 
                     if self.use_object_keypoints:
-                        loss = loss_diffusion + self.loss_w_feet * loss_feet + \
-                            self.loss_w_fk * loss_fk + self.loss_w_obj_pts * loss_obj_pts 
+                        loss = loss_diffusion + self.loss_w_feet * loss_feet + self.loss_w_fk * loss_fk + self.loss_w_obj_pts * loss_obj_pts 
                     else:
                         loss = loss_diffusion 
 
@@ -593,8 +647,7 @@ class Trainer(object):
 
                     # Generate padding mask 
                     actual_seq_len = val_data_dict['seq_len'] + 1 # BS, + 1 since we need additional timestep for noise level 
-                    tmp_mask = torch.arange(self.window+1).expand(val_obj_data.shape[0], \
-                    self.window+1) < actual_seq_len[:, None].repeat(1, self.window+1)
+                    tmp_mask = torch.arange(self.window+1).expand(val_obj_data.shape[0], self.window+1) < actual_seq_len[:, None].repeat(1, self.window+1)
                     # BS X max_timesteps
                     padding_mask = tmp_mask[:, None, :].to(val_obj_data.device)
 
@@ -611,9 +664,8 @@ class Trainer(object):
                     contact_data = val_data_dict['contact_labels'].cuda() # BS X T X 4 
                     
                     data = torch.cat((val_obj_data, val_human_data, contact_data), dim=-1) 
-                    cond_mask = torch.cat((cond_mask, \
-                            torch.ones_like(contact_data).to(cond_mask.device)), dim=-1) 
-                   
+                    cond_mask = torch.cat((cond_mask, torch.ones_like(contact_data).to(cond_mask.device)), dim=-1) 
+                   # 언어조건 
                     if self.add_language_condition:
                         text_anno_data = val_data_dict['text']
                         language_input = self.encode_text(text_anno_data) # BS X 512 
@@ -631,7 +683,7 @@ class Trainer(object):
                 
                     val_loss = val_loss_diffusion + self.loss_w_feet * val_loss_feet + \
                         self.loss_w_fk * val_loss_fk + self.loss_w_obj_pts * val_loss_obj_pts
-                  
+                  # 로그관련 
                     if self.use_wandb:
                         val_log_dict = {
                             "Validation/Loss/Total Loss": val_loss.item(),
@@ -659,11 +711,12 @@ class Trainer(object):
                                         rest_human_offsets=rest_human_offsets)
                        
                         for_vis_gt_data = torch.cat((val_obj_data, val_human_data), dim=-1)
-                       
+                       # 시각화에는 접촉라벨이 필요없어서 제거함 
                         all_res_list = all_res_list[:, :, :-4] 
                         cond_mask = cond_mask[:, :, :-4]
-
+                        # gt 저장 
                         self.gen_vis_res(for_vis_gt_data, val_data_dict, self.step, cond_mask, vis_gt=True)
+                        # 예측저장 
                         self.gen_vis_res(all_res_list, val_data_dict, self.step, cond_mask)
 
             self.step += 1
@@ -1045,7 +1098,7 @@ class Trainer(object):
         else:
             milestone = "10" # 9, 10
             self.load(milestone, pretrained_path=self.opt.pretrained_model) 
-
+        #diffusion모델들은 지수이동평균으로 파라미터 관리한대 자세한건 모름 ..
         self.ema.ema_model.eval()
 
         if self.test_on_train:
@@ -1129,7 +1182,7 @@ class Trainer(object):
             data = torch.cat((val_obj_data, val_human_data, contact_data), dim=-1) 
             cond_mask = torch.cat((cond_mask, \
                     torch.ones_like(contact_data).to(cond_mask.device)), dim=-1) 
-           
+           # 모델 결과 출력 all_res_list  
             if self.add_language_condition:
                 text_anno_data = val_data_dict['text']
                 language_input = self.encode_text(text_anno_data) # BS X 512 
@@ -1177,19 +1230,19 @@ class Trainer(object):
 
             if self.use_object_keypoints:
                 all_res_list = all_res_list[:, :, :-4] 
-#save_obj_only= True 하면 이미지랑 여러가지 저장안됨 동영상이랑 등등등
+#save_obj_only= True 하면 이미지랑 여러가지 저장안됨 동영상이랑 등등등  왜 테스트셋 때는 gen_vis_res_generic
             gt_human_verts_list, gt_human_jnts_list, gt_human_trans_list, gt_human_rot_list, \
             gt_obj_com_pos_list, gt_obj_rot_mat_list, gt_obj_verts_list, human_faces_list, obj_faces_list, _ = \
             self.gen_vis_res_generic(for_vis_gt_data, val_data_dict, milestone, cond_mask, vis_gt=True, \
             curr_object_name=object_name_list[0], vis_tag=vis_tag, \
             dest_out_vid_path=curr_dest_out_gt_vid_path, \
-            dest_mesh_vis_folder=curr_dest_out_mesh_folder, save_obj_only=True) 
+            dest_mesh_vis_folder=curr_dest_out_mesh_folder, save_obj_only=False) 
            
             pred_human_verts_list, pred_human_jnts_list, pred_human_trans_list, pred_human_rot_list, \
             pred_obj_com_pos_list, pred_obj_rot_mat_list, pred_obj_verts_list, _, _, _ = \
             self.gen_vis_res_generic(all_res_list, val_data_dict, milestone, cond_mask, \
             curr_object_name=object_name_list[0], vis_tag=vis_tag, \
-            dest_out_vid_path=curr_dest_out_vid_path, dest_mesh_vis_folder=curr_dest_out_mesh_folder,save_obj_only= True)
+            dest_out_vid_path=curr_dest_out_vid_path, dest_mesh_vis_folder=curr_dest_out_mesh_folder,save_obj_only= False)
 
             # Save results to npz files
             # Save global joint positions to npz files for evaluation (R_precition, FID, etc)
@@ -2081,7 +2134,7 @@ class Trainer(object):
                         prev_window_cano_rot_mat=prev_window_cano_rot_mat, \
                         prev_window_init_root_trans=prev_window_init_root_trans)
 
-        # Hand and object should be in contact, not penetrating, temporal consistent.
+        # Hand and object should be in , not penetrating, temporal consistent.
         loss_hand_object_interaction = self.apply_hand_object_interaction_guidance_loss(pred_clean_x, rest_human_offsets, data_dict, \
                         contact_labels=contact_labels, curr_window_ref_obj_rot_mat=curr_window_ref_obj_rot_mat, \
                         prev_window_cano_rot_mat=prev_window_cano_rot_mat, \
@@ -2540,6 +2593,68 @@ class Trainer(object):
         output_file = open(mesh_path, "wb+")
         output_file.write(result)
         output_file.close()
+    
+
+    def save_individual_smpl_params_npz(self, curr_global_jpos, curr_local_rot_quat, curr_local_rot_aa_rep, root_trans, data_dict, idx, step, seq_len, left_ankle, right_ankle, left_foot, right_foot, mesh_jnts, mesh_verts, mesh_faces):
+        """
+        Save individual sequence SMPL parameters as npz file
+        """
+        import numpy as np
+        
+        # 기존 저장 폴더 패턴을 따라 npz 폴더 생성
+        save_dir = os.path.join(self.vis_folder, "smpl_motion_params_npz", str(step))
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+        
+        # 시퀀스 정보 추출
+        curr_seq_name = data_dict['seq_name'][0]
+        object_name = data_dict['obj_name'][0]
+        rest_human_offsets = data_dict['rest_human_offsets'][0]
+        trans2joint = data_dict['trans2joint'][0]
+        start_frame_idx = data_dict['s_idx'][0].item() if 's_idx' in data_dict else 0
+        end_frame_idx = data_dict['e_idx'][0].item() if 'e_idx' in data_dict else seq_len[idx]-1
+        actual_len = seq_len[idx]
+        
+        # 파일명 생성 (기존 패턴 참고)
+        if hasattr(self, 'test_unseen_objects') and self.test_unseen_objects:
+            filename = f"{curr_seq_name}_{object_name}_sidx_{start_frame_idx}_eidx_{end_frame_idx}_sample_cnt_0_idx_{idx}"
+        else:
+            filename = f"{curr_seq_name}_sidx_{start_frame_idx}_eidx_{end_frame_idx}_sample_cnt_0_idx_{idx}"
+        
+        npz_path = os.path.join(save_dir, f"{filename}.npz")
+        
+        # SMPL 입력을 위한 완전한 파라미터들 저장
+        np.savez(npz_path,
+                # 시퀀스 정보
+                seq_name=curr_seq_name,
+                obj_name=object_name,
+                start_frame_idx=start_frame_idx,
+                end_frame_idx=end_frame_idx,
+                seq_len=actual_len,
+                step=step,
+                idx=idx,
+                rest_human_offsets = rest_human_offsets,
+                trans2joint = trans2joint,
+                left_ankle= left_ankle,
+                right_ankle=right_ankle,
+                left_foot=left_foot,
+                right_foot=right_foot,
+                mesh_jnts=mesh_jnts.detach().cpu().numpy(),
+                mesh_verts=mesh_verts.detach().cpu().numpy(),
+                mesh_faces=mesh_faces.detach().cpu().numpy(),
+                # SMPL 파라미터들 (현재 루프에서 계산된 값들)
+                betas=data_dict['betas'][0].detach().cpu().numpy(),  # Body shape parameters
+                gender=data_dict['gender'][0],  # Gender
+                local_rot_aa=curr_local_rot_aa_rep.detach().cpu().numpy(),  # T X 22 X 3 - Local rotations in axis-angle
+                local_rot_quat=curr_local_rot_quat.detach().cpu().numpy(),  # T X 22 X 4 - Local rotations in quaternion
+                root_trans=root_trans.detach().cpu().numpy(),  # T X 3 - Root translations
+                global_jpos=curr_global_jpos.detach().cpu().numpy(),  # T X 24 X 3 - Global joint positions
+                # 추가 유용한 정보
+                obj_rot_mat=data_dict['obj_rot_mat'][0].detach().cpu().numpy() if 'obj_rot_mat' in data_dict else None,
+                obj_com_pos=data_dict['obj_com_pos'][0].detach().cpu().numpy() if 'obj_com_pos' in data_dict else None,
+                )
+        
+        print(f"Individual SMPL params saved: {filename}.npz (seq_len: {actual_len})")
 
     def plot_arr(self, t_vec, pred_val, gt_val, dest_path):
         plt.plot(t_vec, gt_val, color='green', label="gt")
@@ -2547,7 +2662,7 @@ class Trainer(object):
         plt.legend(["gt", "pred"])
         plt.savefig(dest_path)
         plt.clf()
-    
+    #장기/ 장면 옵션까지 포함한 범용 시각화  all_res_list(모델 샘플링 결과 ) 그 트레인에서 학습한 모델을 테스트로 시각화할 때 사용 
     def gen_vis_res_generic(self, all_res_list, data_dict, step, cond_mask, vis_gt=False, vis_tag=None, \
                 planned_end_obj_com=None, move_to_planned_path=None, planned_waypoints_pos=None, \
                 vis_long_seq=False, overlap_frame_num=10, planned_scene_names=None, \
@@ -2556,7 +2671,7 @@ class Trainer(object):
                 save_obj_only=False):
 
         # Prepare list used for evaluation. 
-        human_jnts_list = []
+        human_jnts_list = [] #저장되는 관절 위치값 (npz)
         human_verts_list = [] 
         obj_verts_list = [] 
         trans_list = []
@@ -2564,22 +2679,22 @@ class Trainer(object):
         obj_mesh_faces_list = [] 
 
         # all_res_list: N X T X (3+9) 
-        num_seq = all_res_list.shape[0]
-
+        num_seq = all_res_list.shape[0]# 배치 
+        #예측된 오브젝트 중심 좌표
         pred_normalized_obj_trans = all_res_list[:, :, :3] # N X T X 3 
         pred_seq_com_pos = self.ds.de_normalize_obj_pos_min_max(pred_normalized_obj_trans)
-
+        #객체 회전 복원 
         if self.use_random_frame_bps:
             reference_obj_rot_mat = data_dict['reference_obj_rot_mat'] # N X 1 X 3 X 3 
 
             pred_obj_rel_rot_mat = all_res_list[:, :, 3:3+9].reshape(num_seq, -1, 3, 3) # N X T X 3 X 3
             pred_obj_rot_mat = self.ds.rel_rot_to_seq(pred_obj_rel_rot_mat, reference_obj_rot_mat)
-
+        #관절 개수
         num_joints = 24
-    
+        #관절 앞에는 위치좌표
         normalized_global_jpos = all_res_list[:, :, 3+9:3+9+num_joints*3].reshape(num_seq, -1, num_joints, 3)
         global_jpos = self.ds.de_normalize_jpos_min_max(normalized_global_jpos.reshape(-1, num_joints, 3))
-        global_jpos = global_jpos.reshape(num_seq, -1, num_joints, 3) # N X T X 22 X 3 
+        global_jpos = global_jpos.reshape(num_seq, -1, num_joints, 3) # N X T X 24 X 3 
 
         # For putting human into 3D scene 
         if move_to_planned_path is not None:
@@ -2597,17 +2712,19 @@ class Trainer(object):
             trans2joint = trans2joint.repeat(num_seq, 1, 1) # N X 24 X 3 
             seq_len = seq_len.repeat(num_seq) # N 
         seq_len = seq_len.detach().cpu().numpy() # N 
-
+        #시퀀스 마다 시행 
         for idx in range(num_seq):
             curr_global_rot_mat = global_rot_mat[idx] # T X 22 X 3 X 3 
             curr_local_rot_mat = quat_ik_torch(curr_global_rot_mat) # T X 22 X 3 X 3 
+            curr_local_rot_quat = transforms.matrix_to_quaternion(curr_local_rot_mat) # T X 22 X 4 
             curr_local_rot_aa_rep = transforms.matrix_to_axis_angle(curr_local_rot_mat) # T X 22 X 3 
-            
+            curr_global_jpos = global_jpos[idx]
             curr_global_root_jpos = global_root_jpos[idx] # T X 3
      
             curr_trans2joint = trans2joint[idx:idx+1].clone() # 1 X 3 
             
             root_trans = curr_global_root_jpos + curr_trans2joint.to(curr_global_root_jpos.device) # T X 3 
+
 
             # Generate global joint position 
             bs = 1
@@ -2626,12 +2743,40 @@ class Trainer(object):
             else:
                 curr_seq_name = data_dict['seq_name'][0]
                 object_name = data_dict['obj_name'][0]
-          
-            # Get human verts 
+            # clean_motion 사용
+            if not vis_gt:
+                cleaned_local_rot_quat, root_trans = clean_motion(data_dict['rest_human_offsets'][0], curr_local_rot_quat, root_trans, data_dict['trans2joint'][0], curr_global_jpos)
+                curr_local_rot_aa_rep = transforms.quaternion_to_axis_angle(cleaned_local_rot_quat.detach().cpu())
+               
+               
+                # # Get human verts 
+            # mesh_jnts, mesh_verts, mesh_faces = \
+            #     run_smplx_model(root_trans[None].cuda(), curr_local_rot_aa_rep[None].cuda(), \
+            #     betas.cuda(), [gender], self.ds.bm_dict, return_joints24=True)
+            # mj = mesh_jnts[0].detach()   # (T, J, 3)  # J=24(22+두 손가락)지만 7/8/10/11은 동일
+            # mv = mesh_verts[0].detach()  # (T, V, 3)
+
+            # cleand human mesh
             mesh_jnts, mesh_verts, mesh_faces = \
                 run_smplx_model(root_trans[None].cuda(), curr_local_rot_aa_rep[None].cuda(), \
                 betas.cuda(), [gender], self.ds.bm_dict, return_joints24=True)
+            mj = mesh_jnts[0].detach()   # (T, J, 3)  # J=24(22+두 손가락)지만 7/8/10/11은 동일
+            mv = mesh_verts[0].detach()  # (T, V, 3)
 
+
+            foot_heights = compute_foot_heights_from_smpl_v2(
+                mj, mv, xy_radius=0.06, agg='p95', margin=0.005
+            )  # dict {22,23,24,25}
+            # foot_heights: dict {22,23,24,25}
+            h_r_ankle = float(foot_heights[22])  # R_ankle_contact
+            h_r_toe   = float(foot_heights[23])  # R_toe_contact
+            h_l_ankle = float(foot_heights[24])  # L_ankle_contact
+            h_l_toe   = float(foot_heights[25])  # L_toe_contact
+            # Save SMPL motion parameters if enabled
+            #if hasattr(self, 'save_motion_params') and self.save_motion_params and not self.compute_metrics:
+            #self.save_individual_smpl_params_npz(curr_global_jpos, curr_local_rot_quat, curr_local_rot_aa_rep, root_trans, data_dict, idx, step, seq_len, h_l_ankle, h_r_ankle, h_l_toe, h_r_toe, mesh_jnts, mesh_verts, mesh_faces)
+
+            
             if self.test_unseen_objects:
                 # Get object verts 
                 obj_rest_verts, obj_mesh_faces = self.unseen_seq_ds.load_rest_pose_object_geometry(object_name)
@@ -2653,14 +2798,14 @@ class Trainer(object):
                             pred_seq_com_pos[idx], obj_rest_verts.float().to(pred_seq_com_pos.device))
 
             actual_len = seq_len[idx]
+            #배치땜에 0번에 데이터 다 있음 
+            human_jnts_list.append(mesh_jnts[0]) # 사람 관절의 월드 위치좌표
+            human_verts_list.append(mesh_verts[0])  #사람관절의 메시 버텍스
+            obj_verts_list.append(obj_mesh_verts) #오브젝트의 메시 버텍스 
+            trans_list.append(root_trans)  # 루트관절의 월드 위치좌표 
 
-            human_jnts_list.append(mesh_jnts[0])
-            human_verts_list.append(mesh_verts[0]) 
-            obj_verts_list.append(obj_mesh_verts)
-            trans_list.append(root_trans) 
-
-            human_mesh_faces_list.append(mesh_faces)
-            obj_mesh_faces_list.append(obj_mesh_faces) 
+            human_mesh_faces_list.append(mesh_faces) # 사람의 메시 페이스 리스트
+            obj_mesh_faces_list.append(obj_mesh_faces) #오브젝트 메시 페이스 리스트 
 
             if self.compute_metrics:
                 continue 
@@ -2674,7 +2819,7 @@ class Trainer(object):
             
             if not os.path.exists(dest_mesh_vis_folder):
                 os.makedirs(dest_mesh_vis_folder)
-
+            #gt 일 때
             if vis_gt:
                 ball_mesh_save_folder = os.path.join(dest_mesh_vis_folder, \
                                 "ball_objs_step_"+str(step)+"_bs_idx_"+str(idx)+"_gt")
@@ -2684,7 +2829,7 @@ class Trainer(object):
                                 "imgs_step_"+str(step)+"_bs_idx_"+str(idx)+"_gt")
                 out_vid_file_path = os.path.join(dest_mesh_vis_folder, \
                                 "vid_step_"+str(step)+"_bs_idx_"+str(idx)+"_gt.mp4")
-            else:
+            else: # 예측일때 -> 필요한거 
                 ball_mesh_save_folder = os.path.join(dest_mesh_vis_folder, \
                                 "ball_objs_step_"+str(step)+"_bs_idx_"+str(idx))
                 mesh_save_folder = os.path.join(dest_mesh_vis_folder, \
@@ -2698,7 +2843,7 @@ class Trainer(object):
                                 "vid_step_"+str(step)+"_bs_idx_"+str(idx)+".mp4")
                 out_sideview_vid_file_path = os.path.join(dest_mesh_vis_folder, \
                                 "sideview_vid_step_"+str(step)+"_bs_idx_"+str(idx)+".mp4")
-                
+                #씬없는거
                 if vis_wo_scene:
                     ball_mesh_save_folder = ball_mesh_save_folder + "_vis_no_scene"
                     mesh_save_folder = mesh_save_folder + "_vis_no_scene"
@@ -2791,21 +2936,21 @@ class Trainer(object):
                             obj_mesh_verts.detach().cpu().numpy()[:seq_len[idx]], obj_mesh_faces, mesh_save_folder)
 
             # continue 
-            if move_to_planned_path is not None:
-                curr_scene_name = planned_scene_names.split("/")[-4]
-                root_blend_file_folder = "/move/u/jiamanli/datasets/FullBodyManipCapture/processed_manip_data/replica_blender_files"
+            if move_to_planned_path is not None: # 계획된 경로가 존재하는 경우 
+                curr_scene_name = planned_scene_names.split("/")[-4] # 블랜더 파일 경로 필요 
+                root_blend_file_folder = "/home/jeongyoon/HSI/chois_release/processed_data/replica_blender_files"
                 
                 # Top-down view visualization 
                 curr_scene_blend_path = os.path.join(root_blend_file_folder, self.test_scene_name+"_topview.blend")
                 # if not os.path.exists(dest_out_vid_path):
-                if not save_obj_only:
+                if not save_obj_only:  # 오브젝트만 저장하는게 아니면 시각화 진행 (동영상 저장)
                     run_blender_rendering_and_save2video(mesh_save_folder, out_rendered_img_folder, out_vid_file_path, \
                             condition_folder=ball_mesh_save_folder, vis_object=True, vis_condition=True, \
                             scene_blend_path=curr_scene_blend_path) 
                 
             else:
                 floor_blend_path = os.path.join(self.data_root_folder, "blender_files/floor_colorful_mat.blend")
-                if planned_end_obj_com is not None:
+                if planned_end_obj_com is not None: #  계획된 객체 중심점이 존재하는경우
                     if dest_out_vid_path is None:
                         dest_out_vid_path = out_vid_file_path.replace(".mp4", "_wo_scene.mp4")
 
@@ -2825,7 +2970,7 @@ class Trainer(object):
                                         condition_folder=ball_mesh_save_folder, vis_object=True, vis_condition=True, \
                                         scene_blend_path=floor_blend_path)
 
-                    if vis_gt: 
+                    if vis_gt: #gt시각화 진행 
                         if not save_obj_only:
                             run_blender_rendering_and_save2video(mesh_save_folder, out_rendered_img_folder, dest_out_vid_path, \
                                     condition_folder=ball_mesh_save_folder, vis_object=True, vis_condition=True, \
@@ -2834,72 +2979,87 @@ class Trainer(object):
 
             if idx > 1:
                 break 
-
+        # Note: SMPL motion parameters are saved individually in the main loop
+        
+        #human_jnts_list -> 저장되는 120 x 24 x 3 관절 위치값 
         return human_verts_list, human_jnts_list, trans_list, global_rot_mat, pred_seq_com_pos, pred_obj_rot_mat, \
         obj_verts_list, human_mesh_faces_list, obj_mesh_faces_list, dest_out_vid_path  
-
+# 트레인에서 사용하는 시각화 
     def gen_vis_res(self, all_res_list, data_dict, step, cond_mask, vis_gt=False, vis_tag=None, \
                 curr_object_name=None, dest_out_vid_path=None, dest_mesh_vis_folder=None, \
                 save_obj_only=False):
 
         # Prepare list used for evaluation. 
-        human_jnts_list = []
-        human_verts_list = [] 
-        obj_verts_list = [] 
-        trans_list = []
-        human_mesh_faces_list = []
-        obj_mesh_faces_list = [] 
+        human_jnts_list = [] # 120 x 24 x 3 SMPL-h 관절 위치값 
+        human_verts_list = [] # SMPL 에서 생성된 인간 메시의 모든 버텍스 위치 (랜더링시 사용)
+        obj_verts_list = [] # 객체의 모든 버텍스 
+        trans_list = [] # 루트관절의 절대 위치  
+        human_mesh_faces_list = [] # 인간 메시 페이스 리스트
+        obj_mesh_faces_list = [] # 객체 메시 페이스 리스트
 
-        # all_res_list: N X T X (3+9) 
+        # 배치 크기 =32 
         num_seq = all_res_list.shape[0]
-
+        # 먼저 pred_normalized_obj_trans 정규화된 객체 위치좌표 
         pred_normalized_obj_trans = all_res_list[:, :, :3] # N X T X 3 
+        # 정규화 해제 -> 실제 좌표위치 값으로 변환 
         pred_seq_com_pos = self.ds.de_normalize_obj_pos_min_max(pred_normalized_obj_trans)
 
         if self.use_random_frame_bps:
+            # 참고 오브젝트 회전 행렬 gt에서 
             reference_obj_rot_mat = data_dict['reference_obj_rot_mat'] # N X 1 X 3 X 3 
-
+            # 오브젝트 회전 행렬 예측 
             pred_obj_rel_rot_mat = all_res_list[:, :, 3:3+9].reshape(num_seq, -1, 3, 3) # N X T X 3 X 3
+            # 절대 회전으로 변환 
             pred_obj_rot_mat = self.ds.rel_rot_to_seq(pred_obj_rel_rot_mat, reference_obj_rot_mat)
 
         num_joints = 24
     
         normalized_global_jpos = all_res_list[:, :, 3+9:3+9+num_joints*3].reshape(num_seq, -1, num_joints, 3)
         global_jpos = self.ds.de_normalize_jpos_min_max(normalized_global_jpos.reshape(-1, num_joints, 3))
-        global_jpos = global_jpos.reshape(num_seq, -1, num_joints, 3) # N X T X 22 X 3 
-
+        # 사람 관절의 위치 
+        global_jpos = global_jpos.reshape(num_seq, -1, num_joints, 3) # N X T X 24 X 3 
+        # 루트 관절의 위치
         global_root_jpos = global_jpos[:, :, 0, :].clone() # N X T X 3 
-
+        # 사람 관절의 6d 회전 
         global_rot_6d = all_res_list[:, :, 3+9+24*3:3+9+24*3+22*6].reshape(num_seq, -1, 22, 6)
+        # 사람 관절의 6d 회전을 3x3으로 바꾸어 줌 
         global_rot_mat = transforms.rotation_6d_to_matrix(global_rot_6d) # N X T X 22 X 3 X 3 
-
+        # 절대 좌표계의 원점역할 즉 SMPL에 입력되는 골반의 절대 좌표값 얘를 기준으로 위치가 나옴 
         trans2joint = data_dict['trans2joint'].to(all_res_list.device).squeeze(1) # BS X  3 
         seq_len = data_dict['seq_len'] # BS, should only be used during for single window generation. 
         if all_res_list.shape[0] != trans2joint.shape[0]:
             trans2joint = trans2joint.repeat(num_seq, 1, 1) # N X 24 X 3 
             seq_len = seq_len.repeat(num_seq) # N 
-        seq_len = seq_len.detach().cpu().numpy() # N 
-
-        for idx in range(num_seq):
+        seq_len = seq_len.detach().cpu().numpy() # 120이 N번 저장됨 
+        #시퀀스별로 시각화 
+        for idx in range(num_seq): # 배치를 쪼개보자 
+            # 왜 회전부터 하냐 사람 관절의 3x3 회전 행렬 (전역회전)
             curr_global_rot_mat = global_rot_mat[idx] # T X 22 X 3 X 3 
+            # 전역회전을 로컬회전으로 변환 (IK사용)Inverse Kinematics 함수
             curr_local_rot_mat = quat_ik_torch(curr_global_rot_mat) # T X 22 X 3 X 3 
+            # 로컬회전을 축각도로 변환 
             curr_local_rot_aa_rep = transforms.matrix_to_axis_angle(curr_local_rot_mat) # T X 22 X 3 
-            
+            # 루트 관절의 위치 
             curr_global_root_jpos = global_root_jpos[idx] # T X 3
-     
+            # 루트 관절의 위치를 절대 좌표계로 변환 
             curr_trans2joint = trans2joint[idx:idx+1].clone() # 1 X 3 
-            
+            # 루트 관절의 위치를 절대 좌표계로 변환 
             root_trans = curr_global_root_jpos + curr_trans2joint.to(curr_global_root_jpos.device) # T X 3 
 
             # Generate global joint position 
+            # SMPL을 위한 파라미터들 gt에서 가져옴 
             betas = data_dict['betas'][idx]
             gender = data_dict['gender'][idx]
-            
+            # gt 오브젝트 회전 행렬 가져옴 
             curr_gt_obj_rot_mat = data_dict['obj_rot_mat'][idx] # T X 3 X 3
+            # gt 오브젝트 위치 
             curr_gt_obj_com_pos = data_dict['obj_com_pos'][idx] # T X 3 
-          
+            # 예측 오브젝트 회전 행렬 (절대 회전 행렬)
             curr_obj_rot_mat = pred_obj_rot_mat[idx] # T X 3 X 3 
+            # 예측 오브젝트 회전 행렬을 쿼터니언으로 변환 
             curr_obj_quat = transforms.matrix_to_quaternion(curr_obj_rot_mat)
+            # 예측 오브젝트 회전 행렬을 3x3으로 변환 
+            # 모델예측값은 수학적으로 정확하지 않을 수 있기 때문에 수학적 정합성을 위해 쿼터니언화를 거쳐서 정규화 하는 과정 
             curr_obj_rot_mat = transforms.quaternion_to_matrix(curr_obj_quat) # Potentially avoid some prediction not satisfying rotation matrix requirements.
 
             if curr_object_name is not None: 
@@ -2908,7 +3068,8 @@ class Trainer(object):
                 curr_seq_name = data_dict['seq_name'][idx]
                 object_name = data_dict['obj_name'][idx]
           
-            # Get human verts 
+            # Get human verts 모델에 # 루트 관절의 위치를 절대 좌표계로 변환 값, # 로컬회전을 축각도로 변환 값, # 베타값, # 성별, # 모델 딕셔너리, # 24개 관절 위치값 반환
+            # 모델에서 생성된 인간 메시의 관절 위치, 버텍스 위치, 페이스 리스트 
             mesh_jnts, mesh_verts, mesh_faces = \
                 run_smplx_model(root_trans[None].cuda(), curr_local_rot_aa_rep[None].cuda(), \
                 betas.cuda(), [gender], self.ds.bm_dict, return_joints24=True)
@@ -2923,15 +3084,20 @@ class Trainer(object):
                         pred_seq_com_pos[idx], obj_rest_verts.float().to(pred_seq_com_pos.device))
 
             actual_len = seq_len[idx]
-
+            # 인간 매시 관절 위치
             human_jnts_list.append(mesh_jnts[0])
+            # 인간 매시 버텍스 위치
             human_verts_list.append(mesh_verts[0]) 
+            # 객체 버텍스 위치
             obj_verts_list.append(obj_mesh_verts)
+            # 상대 -> 절대 변환 행렬
             trans_list.append(root_trans) 
-
+            # 인간 매시 페이스 리스트
             human_mesh_faces_list.append(mesh_faces)
+            # 객체 매시 페이스 리스트
             obj_mesh_faces_list.append(obj_mesh_faces) 
 
+            # 메트릭 계산 필요 없으면 넘어감 
             if self.compute_metrics:
                 continue 
 
@@ -3001,24 +3167,69 @@ class Trainer(object):
             # mesh_verts = mesh_verts[:, ::30, :, :] # 1 X T X Nv X 3
             # obj_mesh_verts = obj_mesh_verts[::30, :, :] # T X Nv X 3 
 
+            # 메시 버텍스와 페이스(사람) 오브젝트 메시 버텍스와 페이스 저장폴더 이거 저장 위치가 랜더링시 들어감   
+            # 버텍스는 시퀀스별로 값이 다름 따라서 시퀀스랭스 만큼 들어가야함 반면 페이스는 고정값임 -> 어느 버텍스끼리 연결되는지 정보 저장 
             save_verts_faces_to_mesh_file_w_object(mesh_verts.detach().cpu().numpy()[0][:seq_len[idx]], \
                     mesh_faces.detach().cpu().numpy(), \
                     obj_mesh_verts.detach().cpu().numpy()[:seq_len[idx]], obj_mesh_faces, mesh_save_folder)
 
             if dest_out_vid_path is None:
                 dest_out_vid_path = out_vid_file_path
-
+            # 바닥 블랜더 경로 
             floor_blend_path = os.path.join(self.data_root_folder, "blender_files/floor_colorful_mat.blend")
             if vis_gt: 
                 run_blender_rendering_and_save2video(mesh_save_folder, out_rendered_img_folder, dest_out_vid_path, \
                         condition_folder=ball_mesh_save_folder, vis_object=True, vis_condition=True, \
                         scene_blend_path=floor_blend_path)
-            else:
+            else:                   # 각 프레임별 메시 저장 폴더 및 랜더링 이미지 폴더 위치 저장 위치의 패스 
                 run_blender_rendering_and_save2video(mesh_save_folder, out_rendered_img_folder, dest_out_vid_path, \
                         condition_folder=ball_mesh_save_folder, vis_object=True, vis_condition=True, \
                         scene_blend_path=floor_blend_path)
             
-            if idx >= 1:
+            if idx >= 1: # 학습이라서 시각화는 하나만 해
                 break 
+        return human_verts_list, human_jnts_list, trans_list, global_rot_mat, pred_seq_com_pos, pred_obj_rot_mat, obj_verts_list, human_mesh_faces_list, obj_mesh_faces_list, dest_out_vid_path
 
-        return human_verts_list, human_jnts_list, trans_list, global_rot_mat, pred_seq_com_pos, pred_obj_rot_mat, obj_verts_list, human_mesh_faces_list, obj_mesh_faces_list, dest_out_vid_path  
+def run_sample(opt, device):
+    # Prepare Directories
+    save_dir = Path(opt.save_dir)
+    wdir = save_dir / 'weights'
+
+    # Define model     
+    repr_dim = 3 + 9 
+
+    repr_dim += 24 * 3 + 22 * 6 
+
+    if opt.use_object_keypoints:
+        repr_dim += 4 
+
+    loss_type = "l1"
+
+    diffusion_model = ObjectCondGaussianDiffusion(opt, d_feats=repr_dim, d_model=opt.d_model, \
+                n_dec_layers=opt.n_dec_layers, n_head=opt.n_head, d_k=opt.d_k, d_v=opt.d_v, \
+                max_timesteps=opt.window+1, out_dim=repr_dim, timesteps=1000, \
+                objective="pred_x0", loss_type=loss_type, \
+                input_first_human_pose=opt.input_first_human_pose, \
+                use_object_keypoints=opt.use_object_keypoints)
+
+    diffusion_model.to(device)
+
+    trainer = Trainer(
+        opt,
+        diffusion_model,
+        train_batch_size=opt.batch_size, # 32
+        train_lr=opt.learning_rate, # 1e-4
+        train_num_steps=8000000,         # 700000, total training steps
+        gradient_accumulate_every=2,    # gradient accumulation steps
+        ema_decay=0.995,                # exponential moving average decay
+        amp=True,                        # turn on mixed precision
+        results_folder=str(wdir),
+        use_wandb=False 
+    )
+
+    if opt.use_long_planned_path:
+        trainer.cond_sample_res_w_long_planned_path() 
+    else:
+        trainer.cond_sample_res()
+
+    torch.cuda.empty_cache()  
