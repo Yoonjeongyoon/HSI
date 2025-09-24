@@ -2,6 +2,8 @@ import argparse
 import os
 import torch
 from trainer_chois import run_sample
+import time 
+from datetime import timedelta, datetime 
 
 def parse_opt():
     parser = argparse.ArgumentParser()
@@ -77,8 +79,14 @@ def parse_opt():
     return opt
 
 if __name__ == "__main__":
+    start = time.perf_counter()
     opt = parse_opt()
     opt.save_dir = os.path.join(opt.project, opt.exp_name)
     opt.exp_name = opt.save_dir.split('/')[-1]
     device = torch.device(f"cuda:{opt.device}" if torch.cuda.is_available() else "cpu")
     run_sample(opt, device)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()  # GPU 작업 끝까지 기다리기
+    
+    end = time.perf_counter()
+    print(f"총 실행 시간: {end - start:.2f} 초")

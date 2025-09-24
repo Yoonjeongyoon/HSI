@@ -1,15 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-NPZ 파일에서 120프레임 모션 시각화 스크립트
-
-이 스크립트는 trainer_chois.py의 gen_vis_res_generic 함수를 참고하여
-저장된 NPZ 파일로부터 SMPL 모션을 시각화합니다.
-
-사용법:
-    python visualize_motion_from_npz.py --npz_file path/to/motion_params.npz --output_dir ./visualization
-"""
-
 import os
 import sys
 import argparse
@@ -21,7 +9,6 @@ from pathlib import Path
 # 프로젝트 경로 추가
 sys.path.append('/home/jeongyoon/HSI/chois_release')
 
-# 필요한 모듈들 import
 from manip.vis.blender_vis_mesh_motion import run_blender_rendering_and_save2video, save_verts_faces_to_mesh_file_w_object
 from manip.data.cano_traj_dataset import CanoObjectTrajDataset
 from pytorch3d import transforms
@@ -31,13 +18,6 @@ from trainer_chois import run_smplx_model
 
 class MotionVisualizer:
     def __init__(self, data_root_folder, device='cuda:0'):
-        """
-        모션 시각화기 초기화
-        
-        Args:
-            data_root_folder (str): 데이터 루트 폴더 경로
-            device (str): 사용할 디바이스
-        """
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.data_root_folder = data_root_folder
         
@@ -49,18 +29,8 @@ class MotionVisualizer:
             use_object_splits=False,
             use_object_keypoints=True
         )
-        print(f"Initialized dataset with {len(self.ds)} sequences")
-        
+        #npz에서 로드하는 부분 추가로 필요한 부분이 있다면 입력
     def load_npz_data(self, npz_path):
-        """
-        NPZ 파일에서 모션 데이터 로드
-        
-        Args:
-            npz_path (str): NPZ 파일 경로
-            
-        Returns:
-            dict: 로드된 모션 데이터
-        """
         try:
             data = np.load(npz_path, allow_pickle=True)
             
@@ -81,15 +51,7 @@ class MotionVisualizer:
                 motion_data['obj_rot_mat'] = torch.from_numpy(data['obj_rot_mat']).float().to(self.device)
             if 'obj_com_pos' in data and data['obj_com_pos'] is not None:
                 motion_data['obj_com_pos'] = torch.from_numpy(data['obj_com_pos']).float().to(self.device)
-                
-            print(f"Loaded motion data:")
-            print(f"  - Sequence: {motion_data['seq_name']}")
-            print(f"  - Object: {motion_data['obj_name']}")
-            print(f"  - Gender: {motion_data['gender']}")
-            print(f"  - Sequence length: {motion_data['seq_len']}")
-            print(f"  - Local rotation shape: {motion_data['local_rot_aa'].shape}")
-            print(f"  - Root translation shape: {motion_data['root_trans'].shape}")
-            
+
             return motion_data
             
         except Exception as e:
@@ -97,15 +59,7 @@ class MotionVisualizer:
             return None
     
     def generate_human_mesh(self, motion_data):
-        """
-        SMPL 파라미터로부터 인간 메쉬 생성
-        
-        Args:
-            motion_data (dict): 모션 데이터
-            
-        Returns:
-            tuple: (mesh_joints, mesh_vertices, mesh_faces)
-        """
+
         try:
             betas = motion_data['betas']
             gender = motion_data['gender']
@@ -134,15 +88,7 @@ class MotionVisualizer:
             return None, None, None
     
     def generate_object_mesh(self, motion_data):
-        """
-        객체 메쉬 생성
-        
-        Args:
-            motion_data (dict): 모션 데이터
-            
-        Returns:
-            tuple: (obj_vertices, obj_faces)
-        """
+
         try:
             object_name = motion_data['obj_name']
             
@@ -181,17 +127,7 @@ class MotionVisualizer:
     
     def export_to_mesh_files(self, mesh_verts, mesh_faces, obj_verts, obj_faces, 
                             output_folder, motion_data):
-        """
-        메쉬를 PLY 파일로 저장
-        
-        Args:
-            mesh_verts: 인간 메쉬 버텍스 (T x Nv x 3)
-            mesh_faces: 인간 메쉬 페이스 
-            obj_verts: 객체 메쉬 버텍스 (T x Nv' x 3)
-            obj_faces: 객체 메쉬 페이스
-            output_folder: 출력 폴더
-            motion_data: 모션 데이터
-        """
+
         try:
             seq_len = motion_data['seq_len']
             
@@ -215,13 +151,7 @@ class MotionVisualizer:
             print(f"Error exporting mesh files: {e}")
     
     def create_condition_balls(self, motion_data, output_folder):
-        """
-        조건을 나타내는 구 메쉬 생성 (시작점, 끝점)
-        
-        Args:
-            motion_data: 모션 데이터
-            output_folder: 출력 폴더
-        """
+
         try:
             root_trans = motion_data['root_trans']  # T x 3
             
@@ -255,13 +185,7 @@ class MotionVisualizer:
             print(f"Error creating condition balls: {e}")
     
     def create_ball_mesh(self, positions, output_path):
-        """
-        여러 위치에 구 메쉬 생성 (기존 코드와 호환성을 위해)
-        
-        Args:
-            positions: 위치들 (N x 3)
-            output_path: 출력 파일 경로
-        """
+
         try:
             ball_radius = 0.05
             combined_mesh = None
@@ -282,14 +206,6 @@ class MotionVisualizer:
             print(f"Error creating ball mesh: {e}")
     
     def render_video(self, mesh_folder, output_video_path, condition_folder=None):
-        """
-        Blender를 사용해 비디오 렌더링
-        
-        Args:
-            mesh_folder: 메쉬 파일들이 있는 폴더
-            output_video_path: 출력 비디오 경로
-            condition_folder: 조건 파일들 폴더 (optional)
-        """
         try:
             # 임시 이미지 폴더 생성
             img_folder = os.path.join(os.path.dirname(output_video_path), "temp_imgs")
@@ -309,24 +225,13 @@ class MotionVisualizer:
                 scene_blend_path=floor_blend_path,
                 fps=30
             )
-            
-            print(f"Rendered video: {output_video_path}")
-            
+                      
         except Exception as e:
             print(f"Error rendering video: {e}")
     
     def visualize_motion(self, npz_path, output_dir, render_video=True, create_conditions=True):
-        """
-        NPZ 파일로부터 모션 시각화
-        
-        Args:
-            npz_path (str): NPZ 파일 경로
-            output_dir (str): 출력 디렉토리
-            render_video (bool): 비디오 렌더링 여부
-            create_conditions (bool): 조건 구 메쉬 생성 여부
-        """
-        print(f"Visualizing motion from: {npz_path}")
-        
+
+    
         # NPZ 데이터 로드
         motion_data = self.load_npz_data(npz_path)
         if motion_data is None:
@@ -395,7 +300,7 @@ def main():
     
     # 입력 검증
     if not args.npz_file and not args.batch_process:
-        parser.error("--npz_file 또는 --batch_process 중 하나는 필수입니다.")
+        parser.error("--npz_file")
     
     # 출력 디렉토리 생성
     os.makedirs(args.output_dir, exist_ok=True)

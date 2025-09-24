@@ -5,7 +5,7 @@ import yaml
 import random 
 import json 
 import copy 
-
+import time
 import trimesh 
 
 from matplotlib import pyplot as plt
@@ -34,7 +34,7 @@ from manip.vis.blender_vis_mesh_motion import run_blender_rendering_and_save2vid
 
 from manip.lafan1.utils import quat_inv, quat_mul, quat_between, normalize, quat_normalize 
 
-from evaluation_metrics import compute_metrics, determine_floor_height_and_contacts, compute_metrics_long_seq   
+from evaluation_metrics import compute_metrics, compute_metrics_long_seq   
 
 import clip 
 
@@ -46,7 +46,16 @@ import random
 torch.manual_seed(1)
 random.seed(1)
 
+t_prev = None  # 전역 변수처럼 씀
 
+def tick(msg=""):
+    global t_prev
+    t_cur = time.perf_counter()
+    if t_prev is None:
+        print(f"{msg} 시작")
+    else:
+        print(f"{msg} 경과: {t_cur - t_prev:.3f}초")
+    t_prev = t_cur
 def export_to_ply(points, filename='output.ply'):
     # Open the file in write mode
     with open(filename, 'w') as ply_file:
@@ -2595,10 +2604,8 @@ class Trainer(object):
         output_file.close()
     
 
-    def save_individual_smpl_params_npz(self, curr_global_jpos, curr_local_rot_quat, curr_local_rot_aa_rep, root_trans, data_dict, idx, step, seq_len, left_ankle, right_ankle, left_foot, right_foot, mesh_jnts, mesh_verts, mesh_faces):
-        """
-        Save individual sequence SMPL parameters as npz file
-        """
+    def save_individual_smpl_params_npz(self, curr_global_jpos, curr_local_rot_quat, curr_local_rot_aa_rep, root_trans, data_dict, idx, step, seq_len, right_foot, mesh_jnts, mesh_verts, mesh_faces):
+
         import numpy as np
         
         # 기존 저장 폴더 패턴을 따라 npz 폴더 생성
@@ -2615,7 +2622,6 @@ class Trainer(object):
         end_frame_idx = data_dict['e_idx'][0].item() if 'e_idx' in data_dict else seq_len[idx]-1
         actual_len = seq_len[idx]
         
-        # 파일명 생성 (기존 패턴 참고)
         if hasattr(self, 'test_unseen_objects') and self.test_unseen_objects:
             filename = f"{curr_seq_name}_{object_name}_sidx_{start_frame_idx}_eidx_{end_frame_idx}_sample_cnt_0_idx_{idx}"
         else:
@@ -2635,10 +2641,6 @@ class Trainer(object):
                 idx=idx,
                 rest_human_offsets = rest_human_offsets,
                 trans2joint = trans2joint,
-                left_ankle= left_ankle,
-                right_ankle=right_ankle,
-                left_foot=left_foot,
-                right_foot=right_foot,
                 mesh_jnts=mesh_jnts.detach().cpu().numpy(),
                 mesh_verts=mesh_verts.detach().cpu().numpy(),
                 mesh_faces=mesh_faces.detach().cpu().numpy(),
@@ -2669,7 +2671,6 @@ class Trainer(object):
                 planned_path_floor_height=None, vis_wo_scene=False, text_anno=None, cano_quat=None, \
                 gen_long_seq=False, curr_object_name=None, dest_out_vid_path=None, dest_mesh_vis_folder=None, \
                 save_obj_only=False):
-
         # Prepare list used for evaluation. 
         human_jnts_list = [] #저장되는 관절 위치값 (npz)
         human_verts_list = [] 
@@ -2725,7 +2726,7 @@ class Trainer(object):
             
             root_trans = curr_global_root_jpos + curr_trans2joint.to(curr_global_root_jpos.device) # T X 3 
 
-
+            tick("추론 완료")
             # Generate global joint position 
             bs = 1
             betas = data_dict['betas'][0]
@@ -2747,34 +2748,15 @@ class Trainer(object):
             if not vis_gt:
                 cleaned_local_rot_quat, root_trans = clean_motion(data_dict['rest_human_offsets'][0], curr_local_rot_quat, root_trans, data_dict['trans2joint'][0], curr_global_jpos)
                 curr_local_rot_aa_rep = transforms.quaternion_to_axis_angle(cleaned_local_rot_quat.detach().cpu())
-               
-               
-                # # Get human verts 
-            # mesh_jnts, mesh_verts, mesh_faces = \
-            #     run_smplx_model(root_trans[None].cuda(), curr_local_rot_aa_rep[None].cuda(), \
-            #     betas.cuda(), [gender], self.ds.bm_dict, return_joints24=True)
-            # mj = mesh_jnts[0].detach()   # (T, J, 3)  # J=24(22+두 손가락)지만 7/8/10/11은 동일
-            # mv = mesh_verts[0].detach()  # (T, V, 3)
-
             # cleand human mesh
             mesh_jnts, mesh_verts, mesh_faces = \
                 run_smplx_model(root_trans[None].cuda(), curr_local_rot_aa_rep[None].cuda(), \
                 betas.cuda(), [gender], self.ds.bm_dict, return_joints24=True)
             mj = mesh_jnts[0].detach()   # (T, J, 3)  # J=24(22+두 손가락)지만 7/8/10/11은 동일
             mv = mesh_verts[0].detach()  # (T, V, 3)
-
-
-            foot_heights = compute_foot_heights_from_smpl_v2(
-                mj, mv, xy_radius=0.06, agg='p95', margin=0.005
-            )  # dict {22,23,24,25}
-            # foot_heights: dict {22,23,24,25}
-            h_r_ankle = float(foot_heights[22])  # R_ankle_contact
-            h_r_toe   = float(foot_heights[23])  # R_toe_contact
-            h_l_ankle = float(foot_heights[24])  # L_ankle_contact
-            h_l_toe   = float(foot_heights[25])  # L_toe_contact
             # Save SMPL motion parameters if enabled
             #if hasattr(self, 'save_motion_params') and self.save_motion_params and not self.compute_metrics:
-            #self.save_individual_smpl_params_npz(curr_global_jpos, curr_local_rot_quat, curr_local_rot_aa_rep, root_trans, data_dict, idx, step, seq_len, h_l_ankle, h_r_ankle, h_l_toe, h_r_toe, mesh_jnts, mesh_verts, mesh_faces)
+            #self.save_individual_smpl_params_npz(curr_global_jpos, curr_local_rot_quat, curr_local_rot_aa_rep, root_trans, data_dict, idx, step, seq_len, mesh_jnts, mesh_verts, mesh_faces)
 
             
             if self.test_unseen_objects:
