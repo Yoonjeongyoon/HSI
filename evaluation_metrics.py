@@ -42,10 +42,7 @@ def get_foot_sliding(
     return np.sum(np.array(vert_velocities) > threshold) / verts.shape[0] * 100
 
 def determine_floor_height_and_contacts(body_joint_seq, fps=30):
-    '''
-    Input: body_joint_seq N x 22 x 3 numpy array
-    Contacts are N x 4 where N is number of frames and each row is left heel/toe, right heel/toe
-    '''
+
     FLOOR_VEL_THRESH = 0.005
     FLOOR_HEIGHT_OFFSET = 0.01
 
@@ -109,7 +106,7 @@ def determine_floor_height_and_contacts(body_joint_seq, fps=30):
 
     else:
         floor_height = offset_floor_height = 0.0
-   
+    print(f"Floor Height: {floor_height:.6f}")
     return floor_height
 
 def compute_foot_sliding_for_smpl(pred_global_jpos, floor_height):
