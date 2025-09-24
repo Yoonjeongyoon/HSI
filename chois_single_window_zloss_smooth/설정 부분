@@ -1,2 +1,0 @@
-foot hovering을 명확하게 처리하기 위해 해당 부분과 관련된 명확한 손실을 추가함 .. 절대값 길이로 접촉상태일때 0보다 큰 부분만큼 손실로 처리 
-iteration 200 smooth 적용 tweight 10, cweight 1e-2 zweight 1e-3
